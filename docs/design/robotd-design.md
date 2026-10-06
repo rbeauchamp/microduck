@@ -832,8 +832,30 @@ computed from, so `unhealthy: control loop at 43.9 Hz` can be read next to `miss
 distinguishes a loop being woken late from a loop doing too much, and those have different fixes.
 `robotctl health` adds the software half from `updaterd` and prints both.
 
-`safeToRestart` is false while the policy is enabled and the robot is moving: restarting motor
-control mid-stride is how a robot falls over (`updater-design.md` §7.2).
+`safeToRestart` uses the loop's command-state motion verdict to advise the updater against interrupting a stride (`updater-design.md` §7.2); its stopping rule and limits follow.
+
+### 3.4.1 A completed twist stop
+
+In the ordinary upright, successfully driving branch, restart readiness means the current effective twist target is exactly zero, the twist filter has completed that stop, and the controller is not busy with scripted motion. This is a command-state advisory. It does not measure physical stillness or reserve a stopped interval until the updater restarts the daemon. The existing fallen, held, and other control branches, and the updater's unreachable-daemon exception, remain as described by their owners; this rule is not a universal restart interlock.
+
+`SmoothedTwist` in `robotd/src/main.rs` owns both the filtered command and its completion state. Each tick first applies the existing EMA, `x += alpha * (target - x)`. Only when the entire effective target is exactly zero and every resulting component satisfies its absolute budget does the state become `Stopped`. That variant supplies `[0.0; 3]` to the policy and is the only variant whose `is_stopped()` is true. Otherwise the unmodified EMA result remains `Active`. The effective target is taken after deadman gating; the existing limp-fall reset still forces zero immediately.
+
+| Component | Absolute terminal budget | Meaning |
+|---|---|---|
+| Forward and lateral | `1e-6 m/s` each | Maximum per-component change to the filtered command when completing the stop |
+| Yaw | `1e-6 rad/s` | Maximum change to the filtered yaw command when completing the stop |
+
+These are numerical command budgets, not measured-velocity limits or hardware-certified thresholds. Separate component comparisons keep linear and angular units distinct. The all-components condition preserves the EMA until the whole twist is within budget; the exact-zero target condition never erases a small live request. Even a direction reversal or a subnormal input that rounds this tick's filtered value to zero remains `Active` while its target is nonzero. Non-finite target/state comparisons cannot complete a stop. Head and body smoothing still use the original scalar helper without this endpoint.
+
+**Why the old decision was accidental.** A real-valued EMA with `0 < alpha < 1` approaches zero without reaching it. In binary64 it can stagnate at a nonzero subnormal, whereas squaring the components in `twist_magnitude()` can underflow to zero much earlier. Readiness based on `twist_magnitude() > 0` therefore relied on underflow rather than a defined stop. Changing only that predicate to a tolerance would leave a nonzero policy command behind. The explicit state instead commits the same terminal command that readiness observes.
+
+**Finite completion and its domain.** For a sustained zero target, finite initial components, and real arithmetic, `abs(x_n) = (1 - alpha)^n * abs(x_0)`. For `0 < alpha < 1`, a component reaches budget `epsilon` after at most `ceil(log(epsilon / abs(x_0)) / log(1 - alpha))` updates when `abs(x_0) > epsilon`; the vector takes the maximum of its components' counts, with one update required to apply the rule. At the default `alpha = 0.2`, a largest component of `0.15` or `1.0` gives 54 or 62 updates, respectively: 1.08 or 1.24 seconds at 50 Hz. These durations count uninterrupted filter updates after the effective zero target; deadman delay, scheduling, and bus/control interruptions are additional.
+
+For the executed binary64 operations at the default alpha, the argument does not depend on reaching a subnormal: above `1e-6`, multiplication and subtraction for a zero target stay finite and normal. With round-to-nearest unit roundoff `u = 2^-53` and the represented alpha `a`, their combined relative bound is `(1 + u) * (1 - a + u * a) < 0.800000000000001 < 1`. Thus every component above budget contracts geometrically until it enters the terminal region. Components already within budget cannot grow under these zero-target updates, including in the subnormal region. This establishes finite completion for every finite starting component at the default alpha, assuming standard IEEE-754 binary64 operations without fast-math transformations. It is a mathematical argument about the actual update expression, not a machine-checked theorem or a timing measurement.
+
+The existing startup clamp of `cmd_alpha` to `[0, 1]` is unchanged. The finite-time claim above is specifically for the default alpha: zero, a non-finite setting, or a very small positive setting can prevent progress or make completion impractically slow. A previously non-finite accumulator is also outside the finite-state premise and remains active. This change does not add parameter validation, repair overflow from extreme live commands, or promise a deadline for every accepted configuration. Regardless of those conditions, the terminal constructor still requires a zero target and finite components within budget.
+
+**Why `1e-6`.** It makes the change at the endpoint at most one micrometre per second on each linear command and one microradian per second on yaw. For the ideal real-valued default filter, deleting the entire remaining zero-target tail changes its command integral by at most `dt * epsilon / alpha = 1e-7 m` per linear axis or `1e-7 rad` in yaw (`dt = 0.02 s`). This is a command-integral comparison with the ideal filter, not a bound on robot displacement, tracking error, or the infinite tail of a stagnating floating-point filter. The per-update budget is the implementation's direct bound. The optional standing network's `standing_threshold` is unsuitable: it selects a gait, mixes twist components in a norm, and is absent or disabled in some policy modes. Physical restart assurance would additionally need measured motion, a settling criterion, and coordination with subsequent commands; none is established by this numerical fix.
 
 ### 3.5 Maintenance is a separate namespace
 

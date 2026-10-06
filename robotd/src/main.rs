@@ -659,7 +659,7 @@ struct RobotState {
     mode: AtomicU8,
     /// Published by the loop so the IPC side can answer without consulting it.
     fallen: AtomicBool,
-    /// The policy is driving and has been asked for a non-zero velocity.
+    /// The loop's command-state motion verdict, including unfinished stops and scripted moves.
     moving: AtomicBool,
     /// Torque is on and the joints are at the home pose, so the policy can drive.
     ///
@@ -912,9 +912,8 @@ impl RobotState {
                 reason: Some("forced busy by --busy".into()),
             };
         }
-        // Restarting motor control mid-stride is how a robot falls over
-        // (`updater-design.md` §7.2). A robot that is merely standing, or already down, is
-        // safe to interrupt — it is going nowhere either way.
+        // An advisory snapshot of the loop's verdict, not measured stillness or a reservation
+        // against later commands (robotd-design.md §3.4.1). Keep the existing fallen exception.
         if self.moving.load(Ordering::Relaxed) && !self.fallen.load(Ordering::Relaxed) {
             return proto::SafeToRestartResult {
                 safe: false,
@@ -1440,6 +1439,53 @@ fn slew(ema: &mut f64, target: f64, alpha: f64) {
     }
 }
 
+/// The twist sent to the policy and its stop status are one state: `Stopped` can only
+/// supply an exact zero command. An active target remains active even if rounding or a
+/// direction reversal makes this tick's filtered value zero.
+#[derive(Default)]
+enum SmoothedTwist {
+    #[default]
+    Stopped,
+    Active([f64; 3]),
+}
+
+impl SmoothedTwist {
+    // A numerical command budget, not a measured-velocity or hardware-safety threshold.
+    // Forward/lateral: m/s; yaw: rad/s. See robotd-design.md §3.4.1 for the derivation.
+    const STOP_BUDGET: [f64; 3] = [1e-6, 1e-6, 1e-6];
+
+    fn command(&self) -> [f64; 3] {
+        match self {
+            Self::Stopped => [0.0; 3],
+            Self::Active(command) => *command,
+        }
+    }
+
+    fn is_stopped(&self) -> bool {
+        matches!(self, Self::Stopped)
+    }
+
+    fn update(&mut self, target: [f64; 3], alpha: f64) {
+        let mut command = self.command();
+        for (ema, target) in command.iter_mut().zip(target) {
+            slew(ema, target, alpha);
+        }
+        // Only a zero request may complete a stop. Compare components without squaring:
+        // a norm can underflow to zero while its command is still nonzero. NaN and infinity
+        // fail this comparison, so invalid filter state cannot certify completion either.
+        *self = if target == [0.0; 3]
+            && command
+                .iter()
+                .zip(Self::STOP_BUDGET)
+                .all(|(value, budget)| value.abs() <= budget)
+        {
+            Self::Stopped
+        } else {
+            Self::Active(command)
+        };
+    }
+}
+
 async fn adopt_startup_pose<T: RobotIo>(
     safety: &mut Safety<T>,
     state: &RobotState,
@@ -1910,7 +1956,7 @@ async fn control_loop<T: RobotIo>(
     // setting like the rest of `[control]`, and `robotctl configure` writing the file takes
     // effect on the next start of the daemon, not mid-tick.
     let publish_measurements = params.control.publish_velocity_and_load;
-    let mut twist_ema = [0.0f64; 3];
+    let mut twist = SmoothedTwist::default();
     let mut head_ema = [0.0f64; 4];
     let mut body_ema = [0.0f64; 3];
 
@@ -2747,11 +2793,9 @@ async fn control_loop<T: RobotIo>(
         // body back to nominal rather than gliding, which is its B-button exit.
         let twist_target = if in_limp_fall { [0.0; 3] } else { gated.twist };
         if in_limp_fall {
-            twist_ema = [0.0; 3];
+            twist = SmoothedTwist::Stopped;
         }
-        for (ema, target) in twist_ema.iter_mut().zip(twist_target) {
-            slew(ema, target, cmd_alpha);
-        }
+        twist.update(twist_target, cmd_alpha);
         for (ema, target) in head_ema.iter_mut().zip(gated.head) {
             slew(ema, target, head_alpha);
         }
@@ -2763,7 +2807,7 @@ async fn control_loop<T: RobotIo>(
             body_ema = [0.0; 3];
         }
         let command = PolicyCommand {
-            twist: twist_ema,
+            twist: twist.command(),
             // The chorale's sway rides on top of whatever the head was asked to do, computed
             // last tick (20 ms stale, invisible at sway speed) and slewed to zero when the
             // singing stops so the head settles rather than snaps.
@@ -3116,7 +3160,7 @@ async fn control_loop<T: RobotIo>(
                         step.targets,
                         step.gain,
                         // A scripted move is motion whatever the twist says; so is walking.
-                        step.busy || command.twist_magnitude() > 0.0,
+                        step.busy || !twist.is_stopped(),
                         step.label,
                     ),
                     Err(e) => {
@@ -9115,5 +9159,63 @@ mod tests {
         // And the filter still works afterwards: the next real command slews as always.
         slew(&mut ema, 1.0, 0.3);
         assert!((ema - 0.65).abs() < 1e-12, "{}", ema);
+    }
+
+    /// The old scalar filter still has a tail when the twist's terminal command is due.
+    /// Exercise the production transition; this is not a gait or physical-stop test.
+    #[test]
+    fn a_zero_twist_target_completes_the_default_ramp() {
+        let alpha = Params::default().control.cmd_alpha;
+        let mut twist = SmoothedTwist::Active([1.0, -0.15, 0.5]);
+        let mut old_tail = 1.0;
+        for _ in 0..62 {
+            twist.update([0.0; 3], alpha);
+            slew(&mut old_tail, 0.0, alpha);
+        }
+        assert!(old_tail > 0.0, "the scalar EMA has no terminal state");
+        assert!(twist.is_stopped());
+        assert_eq!(twist.command(), [0.0; 3]);
+        twist.update([0.0; 3], alpha);
+        assert!(twist.is_stopped(), "a completed stop stays at zero");
+    }
+
+    /// A stop must wait for the last axis, and must never certify invalid filter state.
+    #[test]
+    fn a_twist_stop_requires_every_component_within_its_budget() {
+        for axis in 0..3 {
+            let mut command = [0.0; 3];
+            command[axis] = -4.0 * SmoothedTwist::STOP_BUDGET[axis];
+            let mut twist = SmoothedTwist::Active(command);
+            twist.update([0.0; 3], 0.5);
+            assert!(!twist.is_stopped());
+            assert_eq!(twist.command()[axis], command[axis] / 2.0);
+            twist.update([0.0; 3], 0.5);
+            assert!(twist.is_stopped(), "the inclusive boundary completes");
+            assert_eq!(twist.command(), [0.0; 3]);
+        }
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut twist = SmoothedTwist::Active([invalid, 0.0, 0.0]);
+            twist.update([0.0; 3], 0.2);
+            assert!(!twist.is_stopped());
+        }
+    }
+
+    /// Looking only at the output would accept a reversal's zero crossing or underflowed
+    /// live input. Both must remain active; non-finite requests cannot mean "stop" either.
+    #[test]
+    fn a_live_twist_target_cannot_complete_a_stop() {
+        let mut reversal = SmoothedTwist::Active([-1.0, 0.0, 0.0]);
+        reversal.update([1.0, 0.0, 0.0], 0.5);
+        assert_eq!(reversal.command(), [0.0; 3]);
+        assert!(!reversal.is_stopped());
+
+        for target in [f64::from_bits(1), f64::NAN, f64::INFINITY] {
+            let mut twist = SmoothedTwist::default();
+            twist.update([target, 0.0, 0.0], 0.2);
+            assert_eq!(twist.command(), [0.0; 3]);
+            assert!(!twist.is_stopped());
+            twist.update([0.0; 3], 0.2);
+            assert!(twist.is_stopped(), "an actual stop can complete afterwards");
+        }
     }
 }
