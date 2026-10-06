@@ -197,8 +197,9 @@ Concretely:
   check, health probes, model reload) is *optional and timeout-bounded*. A dead
   socket is a normal, expected answer — never a hang, never a panic, never a
   refusal to serve the phone.
-- **Degraded-mode semantics.** With `robotd` down, the safe-to-restart check
-  trivially passes (nothing is moving) and `updaterd` proceeds. Health gating
+- **Degraded-mode semantics.** With `robotd` unreachable, the safe-to-restart check
+  permits recovery and `updaterd` proceeds; silence is not evidence of physical stillness.
+  See the [restart advisory's limits](robotd-design.md#341-a-completed-twist-stop). Health gating
   falls back to "does the new `robotd` come up and report healthy" — which is
   exactly the check that matters when recovering from a bad release.
 - **`btd` reports the truth.** The app must be able to see "daemon unhealthy,
@@ -589,10 +590,7 @@ side effects:
   fails HTTPS cert-date validation before any download. Require NTP sync (or a
   sane-clock check + bounded retry) as a precondition. minisign itself is
   time-independent.
-- **Robot stopped.** We assume the app only offers updates while the robot is
-  stopped/parked (motors safe). `updaterd` still does a light "safe to restart?"
-  query to `robotd` and refuses if not — cheap insurance against restarting
-  motor control mid-motion.
+- **Robot stopped.** We assume the app only offers updates while the robot is stopped/parked (motors safe); `updaterd` also consults `robotd`'s [restart advisory](robotd-design.md#341-a-completed-twist-stop) and refuses an unsafe reply before restarting motor control.
 - **No active remote session.** Restarting `robotd`/`mediad` mid-telepresence is a
   bad surprise; refuse, or warn and require explicit confirmation. See
   [`architecture.md`](architecture.md) §5.

@@ -47,10 +47,8 @@ port = "/dev/ttyS2"
 # given rate, and the loop's own five-minute summary reports the same from inside robotd.
 hz = 50
 
-# Per-tick EMA smoothing on incoming commands: `cmd += alpha * (target - cmd)`. The
-# prototype's `--cmd-alpha` / `--head-alpha` — a stick snap becomes a ramp the gait can
-# follow. 1.0 is pass-through. `cmd_alpha` covers the velocity twist; `head_alpha` covers
-# head targets and the body pose.
+# Command smoothing parameters: see `Control` in robotd-params/src/lib.rs.
+# Twist stop completion: docs/design/robotd-design.md §3.4.1.
 # cmd_alpha = 0.2
 # head_alpha = 0.2
 

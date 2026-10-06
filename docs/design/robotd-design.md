@@ -803,7 +803,7 @@ robot.
 | method | answer |
 |---|---|
 | `robot.health` | **the loop is meeting its deadline** — from achieved rate and missed-deadline count — plus a description of the robot the verdict never consults: loop, bus, IMU, battery, servo and board temperature, and the board's clock ceiling |
-| `robot.safeToRestart` | false while the policy is enabled and the robot is moving |
+| `robot.safeToRestart` | command-state restart advisory; see [§3.4.1](#341-a-completed-twist-stop) |
 | `robot.modelApi` | constant |
 | `robot.remoteSessionActive` | `false` — `mediad` owns the real answer |
 
@@ -832,13 +832,13 @@ computed from, so `unhealthy: control loop at 43.9 Hz` can be read next to `miss
 distinguishes a loop being woken late from a loop doing too much, and those have different fixes.
 `robotctl health` adds the software half from `updaterd` and prints both.
 
-`safeToRestart` uses the loop's command-state motion verdict to advise the updater against interrupting a stride (`updater-design.md` §7.2); its stopping rule and limits follow.
+The updater's use of `safeToRestart` is described in [`updater-design.md` §7.2](updater-design.md#72-preflight-preconditions).
 
 ### 3.4.1 A completed twist stop
 
-In the ordinary upright, successfully driving branch, restart readiness means the current effective twist target is exactly zero, the twist filter has completed that stop, and the controller is not busy with scripted motion. This is a command-state advisory. It does not measure physical stillness or reserve a stopped interval until the updater restarts the daemon. The existing fallen, held, and other control branches, and the updater's unreachable-daemon exception, remain as described by their owners; this rule is not a universal restart interlock.
+In the ordinary upright, successfully driving branch, restart readiness means the current effective twist target is exactly zero, the twist filter has completed that stop, and the controller is not busy with scripted motion. This is a command-state advisory. It does not measure physical stillness or reserve a stopped interval until the updater restarts the daemon. The existing fallen, held, and other control branches in [`robotd/src/main.rs`](../../robotd/src/main.rs), and the updater's [unreachable-daemon exception](updater-design.md#41-invariant-btd-and-updaterd-survive-a-dead-robotd), are unchanged; this rule is not a universal restart interlock.
 
-`SmoothedTwist` in `robotd/src/main.rs` owns both the filtered command and its completion state. Each tick first applies the existing EMA, `x += alpha * (target - x)`. Only when the entire effective target is exactly zero and every resulting component satisfies its absolute budget does the state become `Stopped`. That variant supplies `[0.0; 3]` to the policy and is the only variant whose `is_stopped()` is true. Otherwise the unmodified EMA result remains `Active`. The effective target is taken after deadman gating; the existing limp-fall reset still forces zero immediately.
+`SmoothedTwist` in [`robotd/src/main.rs`](../../robotd/src/main.rs) owns both the filtered command and its completion state. Each tick first applies the existing `slew` helper: `x += alpha * (target - x)` for each finite target component, leaving that component unchanged for a non-finite target. Only when the entire effective target is exactly zero and every resulting component satisfies its absolute budget does the state become `Stopped`. That variant supplies `[0.0; 3]` to the policy and is the only variant whose `is_stopped()` is true. Otherwise the helper's result remains `Active`. The effective target is taken after deadman gating; the existing limp-fall reset still forces zero immediately.
 
 | Component | Absolute terminal budget | Meaning |
 |---|---|---|
@@ -856,6 +856,8 @@ For the executed binary64 operations at the default alpha, the argument does not
 The existing startup clamp of `cmd_alpha` to `[0, 1]` is unchanged. The finite-time claim above is specifically for the default alpha: zero, a non-finite setting, or a very small positive setting can prevent progress or make completion impractically slow. A previously non-finite accumulator is also outside the finite-state premise and remains active. This change does not add parameter validation, repair overflow from extreme live commands, or promise a deadline for every accepted configuration. Regardless of those conditions, the terminal constructor still requires a zero target and finite components within budget.
 
 **Why `1e-6`.** It makes the change at the endpoint at most one micrometre per second on each linear command and one microradian per second on yaw. For the ideal real-valued default filter, deleting the entire remaining zero-target tail changes its command integral by at most `dt * epsilon / alpha = 1e-7 m` per linear axis or `1e-7 rad` in yaw (`dt = 0.02 s`). This is a command-integral comparison with the ideal filter, not a bound on robot displacement, tracking error, or the infinite tail of a stagnating floating-point filter. The per-update budget is the implementation's direct bound. The optional standing network's `standing_threshold` is unsuitable: it selects a gait, mixes twist components in a norm, and is absent or disabled in some policy modes. Physical restart assurance would additionally need measured motion, a settling criterion, and coordination with subsequent commands; none is established by this numerical fix.
+
+**Implementation evidence.** The three `SmoothedTwist` unit tests in [`robotd/src/main.rs`](../../robotd/src/main.rs) exercise the production transition and command accessor for the default ramp, component budgets, and invalid or live targets. `a_completed_twist_stop_reaches_the_policy_and_restart_advisory` additionally drives the actual control loop with `FakeIo` and an ONNX fixture that echoes the policy's received twist into joint outputs. It samples the restart advisory on the same motor write, covering explicit release, deadman expiry, a live subnormal request, and a busy scripted move. These are bounded executable checks, not a universal proof or evidence of physical stillness; the fake sensors remain fixed. The ONNX-backed check is explicitly invoked as described in [CONTRIBUTING.md](../../CONTRIBUTING.md#building-and-testing).
 
 ### 3.5 Maintenance is a separate namespace
 
