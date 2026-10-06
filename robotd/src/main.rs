@@ -659,7 +659,8 @@ struct RobotState {
     mode: AtomicU8,
     /// Published by the loop so the IPC side can answer without consulting it.
     fallen: AtomicBool,
-    /// In the driving branch, an active twist or busy scripted motion sets this flag.
+    /// After a successful controller step in the driving branch, an active twist or busy scripted
+    /// motion sets this flag.
     /// The restart advisory reads this flag.
     moving: AtomicBool,
     /// Torque is on and the joints are at the home pose, so the policy can drive.
@@ -1433,7 +1434,7 @@ impl RestRamp {
 /// This filter ignores a target that is not a finite number. JSON can supply infinity (`1e400`).
 /// An infinite target can make the stored value infinite or NaN. Later finite targets cannot
 /// restore a finite value. The safety layer rejects joint targets that are not finite numbers.
-/// Thus, one invalid `robot.move` request can hold the robot's pose until reboot.
+/// Without this guard, one invalid `robot.move` request can hold the robot's pose until reboot.
 fn slew(ema: &mut f64, target: f64, alpha: f64) {
     if target.is_finite() {
         *ema += alpha * (target - *ema);

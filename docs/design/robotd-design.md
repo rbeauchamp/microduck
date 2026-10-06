@@ -858,9 +858,9 @@ completion:
 
 If all conditions are true, the filter changes to `Stopped` and supplies `[0.0; 3]` to the policy.
 If one or more conditions are false, the filter changes to `Active`. Thus, a nonzero target stays
-active even when rounding produces a zero command. In the driving branch, an active twist or busy
-scripted motion sets `moving` to true. Head and body pose use separate scalar filters; the limp-fall
-branch clears the twist before filtering.
+active even when rounding produces a zero command. After a successful controller step in the driving
+branch, an active twist or busy scripted motion sets `moving` to true. Head and body pose use separate
+scalar filters; the limp-fall branch clears the twist before filtering.
 
 Let `x0` be the initial component and `epsilon` its component limit. With a constant zero target, the
 component magnitude becomes at most `epsilon` after `ceil(ln(epsilon / |x0|) / ln(1 - alpha))` updates
