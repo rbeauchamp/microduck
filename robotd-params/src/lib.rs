@@ -1924,9 +1924,9 @@ pub struct Control {
     /// Control loop rate. 50 Hz is inherited from the prototype, where it was chosen on a
     /// Pi Zero 2W — re-derive it on the Radxa rather than trusting it.
     pub hz: u32,
-    /// Per-tick EMA on the velocity twist and body pose: `cmd += α × (target − cmd)`. The prototype's
-    /// `--cmd-alpha` — what turns a stick snap into a ramp the gait can follow. `1.0` is
-    /// pass-through. The twist stop endpoint is specified in `docs/design/robotd-design.md` §3.4.1.
+    /// Per-tick EMA on the velocity twist and body pose: `cmd += α × (target − cmd)`.
+    /// The prototype's `--cmd-alpha` — what turns a stick snap into a ramp the gait can follow.
+    /// `1.0` is pass-through. Twist stop completion: `docs/design/robotd-design.md` §3.4.1.
     pub cmd_alpha: f64,
     /// Per-tick scalar EMA on head targets.
     pub head_alpha: f64,

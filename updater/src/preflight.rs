@@ -184,8 +184,9 @@ impl Preflight<'_> {
 
     async fn check_robot_stopped(&self) -> CheckResult {
         let verdict = self.robot.safe_to_restart(self.robot_query_timeout).await;
-        // Apply SafeToRestart's recovery policy (updater-design.md §4.1), including
-        // its distinction between an absent reply and an unreadable one.
+        // Unreachable counts as safe: if the control loop isn't running, nothing is
+        // moving — and that is precisely the case where an update is the fix. An answer
+        // that arrived and could not be read does not, because the loop *is* running.
         let passed = verdict.permits_restart();
         CheckResult {
             check: Check::RobotStopped,

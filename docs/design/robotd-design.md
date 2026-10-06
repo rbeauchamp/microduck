@@ -803,7 +803,7 @@ robot.
 | method | answer |
 |---|---|
 | `robot.health` | **the loop is meeting its deadline** — from achieved rate and missed-deadline count — plus a description of the robot the verdict never consults: loop, bus, IMU, battery, servo and board temperature, and the board's clock ceiling |
-| `robot.safeToRestart` | command-state restart advisory; see [§3.4.1](#341-a-completed-twist-stop) |
+| `robot.safeToRestart` | false while the loop reports motion and the robot is not fallen; twist stop completion is [§3.4.1](#341-a-completed-twist-stop) |
 | `robot.modelApi` | constant |
 | `robot.remoteSessionActive` | `false` — `mediad` owns the real answer |
 
@@ -832,32 +832,39 @@ computed from, so `unhealthy: control loop at 43.9 Hz` can be read next to `miss
 distinguishes a loop being woken late from a loop doing too much, and those have different fixes.
 `robotctl health` adds the software half from `updaterd` and prints both.
 
-The updater's use of `safeToRestart` is described in [`updater-design.md` §7.2](updater-design.md#72-preflight-preconditions).
+Restarting motor control mid-stride can make the robot fall (`updater-design.md` §7.2).
+`safeToRestart` refuses while the loop reports motion, except when the robot is already fallen and
+recovery is allowed.
 
-### 3.4.1 A completed twist stop
+#### 3.4.1 A completed twist stop
 
-In the ordinary upright, successfully driving branch, restart readiness means the current effective twist target is exactly zero, the twist filter has completed that stop, and the controller is not busy with scripted motion. This is a command-state advisory. It does not measure physical stillness or reserve a stopped interval until the updater restarts the daemon. The existing fallen, held, and other control branches in [`robotd/src/main.rs`](../../robotd/src/main.rs), and the updater's [unreachable-daemon exception](updater-design.md#41-invariant-btd-and-updaterd-survive-a-dead-robotd), are unchanged; this rule is not a universal restart interlock.
+The twist sent to the policy is smoothed per tick, `x += alpha * (target - x)` (`[control]
+cmd_alpha`). `SmoothedTwist` in `robotd/src/main.rs` gives that ramp an end: after the EMA step, an
+effective target of exactly zero and finite components within their budgets produces `Stopped` and
+the policy receives `[0.0; 3]`. The effective target is taken after the deadman.
 
-`SmoothedTwist` in [`robotd/src/main.rs`](../../robotd/src/main.rs) owns both the filtered command and its completion state. Each tick first applies the existing `slew` helper: `x += alpha * (target - x)` for each finite target component, leaving that component unchanged for a non-finite target. Only when the entire effective target is exactly zero and every resulting component satisfies its absolute budget does the state become `Stopped`. That variant supplies `[0.0; 3]` to the policy and is the only variant whose `is_stopped()` is true. Otherwise the helper's result remains `Active`. The effective target is taken after deadman gating; the existing limp-fall reset still forces zero immediately.
+| Component | Absolute command budget |
+|---|---|
+| Forward, lateral | `1e-6 m/s` each |
+| Yaw | `1e-6 rad/s` |
 
-| Component | Absolute terminal budget | Meaning |
-|---|---|---|
-| Forward and lateral | `1e-6 m/s` each | Maximum per-component change to the filtered command when completing the stop |
-| Yaw | `1e-6 rad/s` | Maximum change to the filtered yaw command when completing the stop |
+A nonzero target remains `Active`, however small it is and whatever the filter rounds to. In the
+driving branch, restart readiness stays false while the twist is active or the controller is busy
+with scripted motion. Head and body keep their scalar smoothing; limp-fall forces the twist to zero.
 
-These are numerical command budgets, not measured-velocity limits or hardware-certified thresholds. Separate component comparisons keep linear and angular units distinct. The all-components condition preserves the EMA until the whole twist is within budget; the exact-zero target condition never erases a small live request. Even a direction reversal or a subnormal input that rounds this tick's filtered value to zero remains `Active` while its target is nonzero. Non-finite target/state comparisons cannot complete a stop. Head and body smoothing still use the original scalar helper without this endpoint.
+The budgets bound the command step added by completing a stop. For `|x0| > epsilon` and `0 < alpha <
+1`, the real-valued zero-target ramp reaches a component budget after `ceil(ln(epsilon / |x0|) /
+ln(1 - alpha))` updates. At the default `alpha = 0.2`, this is 54 updates from 0.15 and 62 from 1.0:
+1.08 and 1.24 seconds at 50 Hz, after any deadman delay. The vector waits for its last component. A
+filter state already within budget still needs a zero-target update to complete.
 
-**Why the old decision was accidental.** A real-valued EMA with `0 < alpha < 1` approaches zero without reaching it. In binary64 it can stagnate at a nonzero subnormal, whereas squaring the components in `twist_magnitude()` can underflow to zero much earlier. Readiness based on `twist_magnitude() > 0` therefore relied on underflow rather than a defined stop. Changing only that predicate to a tolerance would leave a nonzero policy command behind. The explicit state instead commits the same terminal command that readiness observes.
+`standing_threshold` is unsuitable for this budget: it selects a gait, and the default policy set
+loads no standing network. `cmd_alpha` is clamped to `[0, 1]` without validation; zero or
+pathological values can prevent progress, and values near zero can make the stop arbitrarily slow. A
+non-finite accumulator cannot complete a stop.
 
-**Finite completion and its domain.** For a sustained zero target, finite initial components, and real arithmetic, `abs(x_n) = (1 - alpha)^n * abs(x_0)`. For `0 < alpha < 1`, a component reaches budget `epsilon` after at most `ceil(log(epsilon / abs(x_0)) / log(1 - alpha))` updates when `abs(x_0) > epsilon`; the vector takes the maximum of its components' counts, with one update required to apply the rule. At the default `alpha = 0.2`, a largest component of `0.15` or `1.0` gives 54 or 62 updates, respectively: 1.08 or 1.24 seconds at 50 Hz. These durations count uninterrupted filter updates after the effective zero target; deadman delay, scheduling, and bus/control interruptions are additional.
-
-For the executed binary64 operations at the default alpha, the argument does not depend on reaching a subnormal: above `1e-6`, multiplication and subtraction for a zero target stay finite and normal. With round-to-nearest unit roundoff `u = 2^-53` and the represented alpha `a`, their combined relative bound is `(1 + u) * (1 - a + u * a) < 0.800000000000001 < 1`. Thus every component above budget contracts geometrically until it enters the terminal region. Components already within budget cannot grow under these zero-target updates, including in the subnormal region. This establishes finite completion for every finite starting component at the default alpha, assuming standard IEEE-754 binary64 operations without fast-math transformations. It is a mathematical argument about the actual update expression, not a machine-checked theorem or a timing measurement.
-
-The existing startup clamp of `cmd_alpha` to `[0, 1]` is unchanged. The finite-time claim above is specifically for the default alpha: zero, a non-finite setting, or a very small positive setting can prevent progress or make completion impractically slow. A previously non-finite accumulator is also outside the finite-state premise and remains active. This change does not add parameter validation, repair overflow from extreme live commands, or promise a deadline for every accepted configuration. Regardless of those conditions, the terminal constructor still requires a zero target and finite components within budget.
-
-**Why `1e-6`.** It makes the change at the endpoint at most one micrometre per second on each linear command and one microradian per second on yaw. For the ideal real-valued default filter, deleting the entire remaining zero-target tail changes its command integral by at most `dt * epsilon / alpha = 1e-7 m` per linear axis or `1e-7 rad` in yaw (`dt = 0.02 s`). This is a command-integral comparison with the ideal filter, not a bound on robot displacement, tracking error, or the infinite tail of a stagnating floating-point filter. The per-update budget is the implementation's direct bound. The optional standing network's `standing_threshold` is unsuitable: it selects a gait, mixes twist components in a norm, and is absent or disabled in some policy modes. Physical restart assurance would additionally need measured motion, a settling criterion, and coordination with subsequent commands; none is established by this numerical fix.
-
-**Implementation evidence.** The three `SmoothedTwist` unit tests in [`robotd/src/main.rs`](../../robotd/src/main.rs) exercise the production transition and command accessor for the default ramp, component budgets, and invalid or live targets. `a_completed_twist_stop_reaches_the_policy_and_restart_advisory` additionally drives the actual control loop with `FakeIo` and an ONNX fixture that echoes the policy's received twist into joint outputs. It samples the restart advisory on the same motor write, covering explicit release, deadman expiry, a live subnormal request, and a busy scripted move. These are bounded executable checks, not a universal proof or evidence of physical stillness; the fake sensors remain fixed. The ONNX-backed check is explicitly invoked as described in [CONTRIBUTING.md](../../CONTRIBUTING.md#building-and-testing).
+This advisory describes the command. It neither measures the robot's motion nor reserves a stopped
+interval until the restart happens.
 
 ### 3.5 Maintenance is a separate namespace
 
@@ -1077,6 +1084,8 @@ way while the code around it gets simpler.
 - the limp-fall predictor fires on a fall and not on a footfall or a static tilt, and its pose
   ramp ends at the standing pose;
 - deadman zeroes velocity when intents stop;
+- a released twist reaches exact zero at its command budget before the idle controller reports
+  restart readiness; live demands and busy scripted moves still block it;
 - **golden observation vectors** — `(inputs, expected 61-float array)` pairs exported from mjlab and
   committed. A wrong index in the observation does not fail loudly; it produces a plausible robot
   that falls over. Depends on an export from `microduck_brain` (§9.2).
@@ -1095,6 +1104,7 @@ Each test's comment says which failure it exists to prevent, per the repo conven
 | policy path in params, default = release dir | updates carry the policy; devs override it |
 | adopt current pose on start | an update must not move a standing robot |
 | bring-up as a state machine, not a flag | `set_torque` is a transaction per joint |
+| the twist filter has a terminal state | restart readiness must not depend on floating-point underflow (§3.4.1) |
 | the fall verdict reports, it does not gate | what to do about a fall is a control decision (§2.4) |
 | ~~no odometry~~ — reversed | `monitor`'s path map reads it, and it is one `kinematics` pass on a sample the loop already took (§4.4) |
 | the priority chain keeps the runtime's shape | the skills were tuned against its quirks |

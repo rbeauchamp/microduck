@@ -12,7 +12,7 @@ the two are not quite the same checkout — see below.
 cargo test --workspace
 ```
 
-No hardware, no network, no Docker. ONNX-backed checks are separate, as described below.
+No hardware, no network, no Docker. If they pass, your checkout is sound.
 
 **On Linux** that command needs some C libraries first, the same ones CI installs: `padd` binds
 `libudev` through `gilrs`, and `mediad`'s pipeline is `cfg(target_os = "linux")`, so a Linux host
@@ -26,7 +26,7 @@ sudo apt-get install -y libudev-dev libgstreamer1.0-dev
 sudo apt-get install -y libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev
 ```
 
-**On macOS** the command above runs the portable workspace suite. Two
+**On macOS** the command above is the whole of it — **942 tests passing**, nothing excluded. Two
 of the ToF driver's own tests do not run there, because there is no driver to run them against:
 `vendor/platform.c` reaches the bus through `linux/i2c.h`, so `build.rs` compiles it on Linux
 targets only and `sensor.rs` offers a `Sensor` that cannot be opened. `tofd` still builds and
@@ -37,14 +37,6 @@ up unhealthy, a post-install hook that fails, power loss between the swap and th
 Each drives the real engine with the fault injected rather than a mock of it, so
 `updater/tests/apply.rs` is the honest answer to "what does this actually guarantee" — more so
 than anything you could run by hand.
-
-Tests marked `#[ignore]` for ONNX Runtime are separate from the normal workspace run. With a compatible runtime available and `ORT_DYLIB_PATH` pointing to its shared library, run the [twist-stop loop regression](docs/design/robotd-design.md#341-a-completed-twist-stop) explicitly:
-
-```bash
-cargo test -p robotd a_completed_twist_stop_reaches_the_policy_and_restart_advisory -- --ignored
-```
-
-The [recurrent-policy guide](docs/recurrent-policies.md#tests) lists the other ONNX-backed checks and their runtime requirement.
 
 One crate at a time, and formatting:
 

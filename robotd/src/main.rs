@@ -912,8 +912,9 @@ impl RobotState {
                 reason: Some("forced busy by --busy".into()),
             };
         }
-        // An advisory snapshot of the loop's verdict, not measured stillness or a reservation
-        // against later commands (robotd-design.md §3.4.1). Keep the existing fallen exception.
+        // Restarting motor control mid-stride can make the robot fall (updater-design.md §7.2).
+        // The fallen exception permits recovery of a robot already down. `moving` is the
+        // loop's commanded-motion verdict, not a measurement (robotd-design.md §3.4.1).
         if self.moving.load(Ordering::Relaxed) && !self.fallen.load(Ordering::Relaxed) {
             return proto::SafeToRestartResult {
                 safe: false,
@@ -9355,34 +9356,47 @@ mod tests {
             .expect("control loop must stop");
     }
 
-    /// The old scalar filter still has a tail when the twist's terminal command is due.
-    /// Exercise the production transition; this is not a gait or physical-stop test.
+    /// Pin both sides of the documented default completion times: an earlier snap would
+    /// silently increase the command budget, while a later one would extend the stop.
     #[test]
     fn a_zero_twist_target_completes_the_default_ramp() {
         let alpha = Params::default().control.cmd_alpha;
-        let mut twist = SmoothedTwist::Active([1.0, -0.15, 0.5]);
-        let mut old_tail = 1.0;
-        for _ in 0..62 {
+        for (command, ticks) in [([1.0, -0.15, 0.5], 62), ([0.15, 0.0, 0.0], 54)] {
+            let mut twist = SmoothedTwist::Active(command);
+            let mut old_tail = command[0];
+            for _ in 1..ticks {
+                twist.update([0.0; 3], alpha);
+                slew(&mut old_tail, 0.0, alpha);
+            }
+            assert!(
+                !twist.is_stopped(),
+                "the preceding tick is still above 1e-6"
+            );
             twist.update([0.0; 3], alpha);
             slew(&mut old_tail, 0.0, alpha);
+            assert!(old_tail > 0.0, "the scalar EMA has no terminal state");
+            assert!(twist.is_stopped());
+            assert_eq!(twist.command(), [0.0; 3]);
+            twist.update([0.0; 3], alpha);
+            assert!(twist.is_stopped(), "a completed stop stays at zero");
         }
-        assert!(old_tail > 0.0, "the scalar EMA has no terminal state");
-        assert!(twist.is_stopped());
-        assert_eq!(twist.command(), [0.0; 3]);
-        twist.update([0.0; 3], alpha);
-        assert!(twist.is_stopped(), "a completed stop stays at zero");
     }
 
-    /// A stop must wait for the last axis, and must never certify invalid filter state.
+    /// Pin each documented budget independently of STOP_BUDGET so a changed constant
+    /// cannot move its own test boundary. Invalid filter state must never certify a stop.
     #[test]
     fn a_twist_stop_requires_every_component_within_its_budget() {
         for axis in 0..3 {
             let mut command = [0.0; 3];
-            command[axis] = -4.0 * SmoothedTwist::STOP_BUDGET[axis];
+            let above_budget = 1e-6_f64.next_up();
+            command[axis] = -2.0 * above_budget;
             let mut twist = SmoothedTwist::Active(command);
             twist.update([0.0; 3], 0.5);
             assert!(!twist.is_stopped());
-            assert_eq!(twist.command()[axis], command[axis] / 2.0);
+            assert_eq!(twist.command()[axis], -above_budget);
+
+            command[axis] = -2e-6;
+            let mut twist = SmoothedTwist::Active(command);
             twist.update([0.0; 3], 0.5);
             assert!(twist.is_stopped(), "the inclusive boundary completes");
             assert_eq!(twist.command(), [0.0; 3]);

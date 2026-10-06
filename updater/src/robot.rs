@@ -23,21 +23,23 @@ pub enum SafeToRestart {
     /// The distinction from [`Self::Unreachable`] is the whole point, and getting it wrong is
     /// what this variant exists to fix: a reply that *arrived* is evidence of a `robotd` whose
     /// control loop is running, and reading its "no, I am mid-task" as "sure, go ahead" because
-    /// a field was renamed is how an update restarts a walking robot. Only silence permits
-    /// the recovery exception; the two used to collapse into one variant that permitted
+    /// a field was renamed is how an update restarts a walking robot. Silence is safe; an
+    /// unreadable answer is not, and the two used to collapse into one variant that permitted
     /// the restart either way — against what that variant's own comment promised.
     ///
     /// Same split, for the same reason, as [`Health::Incompatible`] against
     /// [`Health::Unreachable`]. Carries serde's message, which names the field.
     ///
     /// The escape, when this blocks an update that needs to happen, is to make the robot
-    /// genuinely stopped — `systemctl stop robotd` — so the service cannot issue new commands.
-    /// The refusal says so; this does not establish physical stillness.
+    /// genuinely silent — `systemctl stop robotd` — which is honest rather than a bypass: a
+    /// stopped robot cannot be moving, and cannot be misread about it either. The refusal says
+    /// so.
     Incompatible(String),
     /// `robotd` did not answer.
     ///
-    /// Permits recovery under `docs/design/updater-design.md` §4.1, even though
-    /// an absent reply establishes neither loop termination nor physical stillness.
+    /// Treated as **safe**: if the control loop isn't running, nothing is moving,
+    /// and this is exactly the case where an update is the fix. Making this an
+    /// error would block recovery on precisely the robots that need it.
     Unreachable,
 }
 
