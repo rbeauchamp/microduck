@@ -240,7 +240,8 @@ report, timestamped by the kernel:
 
 Move the sticks and the bars follow them. What the trace is for is the row above: a bar per report,
 so a stall is a spike, and one that has already recovered is still on screen. Full height is 100 ms
-— the point a driver starts to feel it — and past 500 ms `robotd` has zeroed the velocity.
+— the point a driver starts to feel it. The [control-loop design](../design/robotd-design.md#341-a-completed-twist-stop)
+defines twist stop completion.
 
 **Nothing else on the robot can show this.** `padd` resends the last stick value at 50 Hz, so a
 radio that has stopped delivering still looks like a live driver everywhere downstream: `robot.state`
@@ -271,8 +272,7 @@ two minutes**: a pad at rest sends nothing, and silence reads exactly like a sta
 sudo sh /tmp/pad-link-test.sh
 ```
 
-It counts drops, and the gaps between the pad's input reports while it is connected. A gap past
-500 ms is the robot stopping — `robotd` zeroes the velocity there. Every drop is followed by the
+It counts drops, and the gaps between the pad's input reports while it is connected. Every drop is followed by the
 kernel's reason: `0x08` is a supervision timeout, which means range or interference, and `0x13`
 means somebody switched the pad off.
 

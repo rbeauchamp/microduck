@@ -869,8 +869,9 @@ The exception for a robot that has fallen permits recovery.
 
 The **twist** contains forward velocity, lateral velocity, and yaw rate. The **effective target** is
 the twist after the deadman check and the limp-fall override. The **applied twist** is the filter
-output sent to the policy. Each **component limit** bounds only the change from the updated
-filter result to zero.
+output in `PolicyCommand::twist`. The driving branch passes this command to `Controller::step`.
+The controller can replace the twist for the active policy; see [§2.3](#23-the-policy).
+Each **component limit** bounds only the change from the updated filter result to zero.
 
 `SmoothedTwist` in `robotd/src/main.rs` applies an exponential moving average (EMA) during each
 control-loop update: `x += alpha * (target - x)`. The control loop clamps `[control] cmd_alpha` to
@@ -886,7 +887,7 @@ completion:
 | Forward velocity, lateral velocity | `1e-6 m/s` each |
 | Yaw rate | `1e-6 rad/s` |
 
-If all conditions are true, the filter changes to `Stopped` and supplies `[0.0; 3]` to the policy.
+If all conditions are true, the filter changes to `Stopped` and supplies `[0.0; 3]` as the applied twist.
 If one or more conditions are false, the filter changes to `Active`. Thus, a nonzero target stays
 active even when rounding produces a zero command. After a successful controller step in the driving
 branch, an active twist or busy scripted motion sets `moving` to true. Head and body pose use separate
@@ -1129,8 +1130,7 @@ way while the code around it gets simpler.
 - the limp-fall predictor fires on a fall and not on a footfall or a static tilt, and its pose
   ramp ends at the standing pose;
 - deadman zeroes velocity when intents stop;
-- the control loop sends the zero applied twist to the policy after stop completion; the restart
-  conditions are in [§3.4.1](#341-a-completed-twist-stop);
+- twist stop completion and the restart advisory follow [§3.4.1](#341-a-completed-twist-stop);
 - **golden observation vectors** — `(inputs, expected 61-float array)` pairs exported from mjlab and
   committed. A wrong index in the observation does not fail loudly; it produces a plausible robot
   that falls over. Depends on an export from `microduck_brain` (§9.2).

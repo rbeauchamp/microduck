@@ -32,7 +32,7 @@ sudo apt-get install -y libudev-dev libgstreamer1.0-dev
 sudo apt-get install -y libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev
 ```
 
-**On macOS** the command above is the whole of it — **942 tests passing**, nothing excluded. Two
+**On macOS**, use the same command. Cargo reports the current test results. Two
 of the ToF driver's own tests do not run there, because there is no driver to run them against:
 `vendor/platform.c` reaches the bus through `linux/i2c.h`, so `build.rs` compiles it on Linux
 targets only and `sensor.rs` offers a `Sensor` that cannot be opened. `tofd` still builds and
