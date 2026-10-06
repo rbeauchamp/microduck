@@ -833,15 +833,14 @@ distinguishes a loop being woken late from a loop doing too much, and those have
 `robotctl health` adds the software half from `updaterd` and prints both.
 
 A restart during a walking step can make the robot fall (`updater-design.md` §7.2).
-`safeToRestart` returns `false` while the control loop reports motion and the robot has not fallen.
 The exception for a robot that has fallen permits recovery.
 
 #### 3.4.1 A completed twist stop
 
 The **twist** contains forward velocity, lateral velocity, and yaw rate. The **effective target** is
 the twist after the deadman check and the limp-fall override. The **applied twist** is the filter
-output sent to the policy. Each **component limit** bounds the additional change from the EMA result
-to zero.
+output sent to the policy. Each **component limit** bounds only the change from the updated
+filter result to zero.
 
 `SmoothedTwist` in `robotd/src/main.rs` applies an exponential moving average (EMA) during each
 control-loop update: `x += alpha * (target - x)`. The control loop clamps `[control] cmd_alpha` to
@@ -863,16 +862,16 @@ active even when rounding produces a zero command. In the driving branch, an act
 scripted motion sets `moving` to true. Head and body pose use separate scalar filters; the limp-fall
 branch clears the twist before filtering.
 
-Let `x0` be the initial component and `epsilon` its component limit. In real arithmetic, a zero
-target reaches this limit after `ceil(ln(epsilon / |x0|) / ln(1 - alpha))` updates. This formula
-requires `|x0| > epsilon` and `0 < alpha < 1`. With default `alpha = 0.2`, starting values `0.15`
-and `1.0` require 54 and 62 updates. At 50 Hz, these durations are 1.08 s and 1.24 s after the
-deadman delay, if applicable. The duration assumes uninterrupted updates with a zero target.
+Let `x0` be the initial component and `epsilon` its component limit. With a constant zero target, the
+component magnitude becomes at most `epsilon` after `ceil(ln(epsilon / |x0|) / ln(1 - alpha))` updates
+in real arithmetic. This formula requires `|x0| > epsilon` and `0 < alpha < 1`. With default
+`alpha = 0.2`, starting values `0.15` and `1.0` require 54 and 62 updates. At 50 Hz, these durations
+are 1.08 s and 1.24 s after the deadman delay, if applicable. The duration assumes uninterrupted
+updates with a zero target.
 
-Stop completion requires `abs(component) <= limit` for all three components. If all component
-magnitudes are at most their limits, completion still needs one update with a zero target.
-`standing_threshold` selects a gait, so it serves a different purpose from the component limits. The
-default policy set has no separate standing network.
+If all initial component magnitudes are at most their limits, completion still needs one update with
+a zero target. `standing_threshold` selects a gait, so it serves a different purpose from the
+component limits. The default policy set has no separate standing network.
 
 Parameter validation does not reject zero or NaN coefficients. Both values can prevent completion.
 Binary64 rounding can also prevent progress for some positive coefficients close to zero. The filter
@@ -1100,8 +1099,8 @@ way while the code around it gets simpler.
 - the limp-fall predictor fires on a fall and not on a footfall or a static tilt, and its pose
   ramp ends at the standing pose;
 - deadman zeroes velocity when intents stop;
-- a zero effective target completes a twist stop at the component limits; an active target or busy
-  scripted motion keeps the restart advisory false;
+- the control loop sends the zero applied twist to the policy after stop completion; the restart
+  conditions are in [§3.4.1](#341-a-completed-twist-stop);
 - **golden observation vectors** — `(inputs, expected 61-float array)` pairs exported from mjlab and
   committed. A wrong index in the observation does not fail loudly; it produces a plausible robot
   that falls over. Depends on an export from `microduck_brain` (§9.2).

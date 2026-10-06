@@ -1433,7 +1433,7 @@ impl RestRamp {
 /// This filter ignores a target that is not a finite number. JSON can supply infinity (`1e400`).
 /// An infinite target can make the stored value infinite or NaN. Later finite targets cannot
 /// restore a finite value. The safety layer rejects joint targets that are not finite numbers.
-/// Thus, one invalid `robot.move` request could hold the robot's pose until reboot.
+/// Thus, one invalid `robot.move` request can hold the robot's pose until reboot.
 fn slew(ema: &mut f64, target: f64, alpha: f64) {
     if target.is_finite() {
         *ema += alpha * (target - *ema);
@@ -1451,7 +1451,7 @@ enum SmoothedTwist {
 }
 
 impl SmoothedTwist {
-    // These component limits bound the change from an updated component to zero.
+    // These component limits bound only the change from an updated component to zero.
     // Forward and lateral velocity use m/s; yaw rate uses rad/s.
     // They do not define a physical safety limit. See robotd-design.md §3.4.1 for the reason.
     const STOP_BUDGET: [f64; 3] = [1e-6, 1e-6, 1e-6];
@@ -3106,9 +3106,8 @@ async fn control_loop<T: RobotIo>(
             // be commanded its pre-fall pose at walking gain, which is precisely the thing
             // the mode exists to stop.
             //
-            // `moving` stays true for the whole sequence: the joints are travelling (down,
-            // then back to the pose), and `safeToRestart` must not say yes in the middle of
-            // a fall.
+            // `moving` stays true during the full sequence because the joints move down and back
+            // to the pose. See robotd-design.md §3.4 for the restart conditions.
             _ if in_limp_fall => match limp_fall {
                 // Command the joints where they already are, at limp gain. Following the
                 // measurement rather than holding a fixed pose is what makes it soft: a
@@ -3160,7 +3159,7 @@ async fn control_loop<T: RobotIo>(
                     Ok(step) => (
                         step.targets,
                         step.gain,
-                        // Scripted motion must block restart even after the twist stop completes.
+                        // A completed twist stop does not stop scripted motion.
                         step.busy || !twist.is_stopped(),
                         step.label,
                     ),
@@ -9238,7 +9237,7 @@ mod tests {
             kick_left: Some(fixture.clone()),
             kick_right: Some("none".into()),
             roulade: Some("none".into()),
-            // Additional filtering or scaling would change the fixture's command values.
+            // A second filter or scaling can change the fixture's command values.
             action_scale: Some(1.0),
             head_lowpass: Some(1.0),
             legs_lowpass: Some(1.0),
@@ -9359,8 +9358,8 @@ mod tests {
     }
 
     /// The filter must stay active on the preceding update and stop on the documented update.
-    /// An earlier stop could make the additional change to zero more than the component limit.
-    /// A later stop would increase the duration.
+    /// An earlier stop can make the change from the EMA result to zero more than the component limit.
+    /// A stop after the documented update takes more time.
     #[test]
     fn a_zero_twist_target_completes_the_default_ramp() {
         let alpha = Params::default().control.cmd_alpha;
