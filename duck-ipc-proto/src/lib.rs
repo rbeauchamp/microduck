@@ -423,7 +423,21 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// an `updaterd` that has not run its first check yet — every board for the minute after it
 /// starts, including the one right after the update that brought v35 in. Both warned. The attempt
 /// tells them apart, and its error is what the warning was pointing at the journal for.
-pub const API_VERSION: u32 = 37;
+///
+/// # v38 — which servos are missing, while the bus is coming up
+///
+/// [`BusHealth::missing`]: the servo IDs that did not answer the last ping round while `robotd`
+/// waits for the bus. A robot with three servos unplugged reported "no robot on the motor bus",
+/// which is the wording for servo power being off, while the daemon's own log named the three.
+/// Additive: absent from an older `robotd`, and an empty list reads as "not told", which is what
+/// the old wording assumed anyway.
+///
+/// # v39 — `robot.rest`
+///
+/// [`method::ROBOT_REST`]: `robot.shutdown`'s sit and rest pose, ending in torque off and a servo
+/// reboot instead of a power-off. The pad's held Select, released before the power-off threshold.
+/// A new route: a `robotd` predating it answers METHOD_NOT_FOUND, by name.
+pub const API_VERSION: u32 = 39;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -537,6 +551,26 @@ pub const JOINT_NAMES: [&str; 15] = [
     "right_ankle",
 ];
 
+/// Each joint's Dynamixel ID, indexed as [`JOINT_NAMES`].
+///
+/// Protocol for the same reason the names are: [`BusHealth::missing`] carries IDs, because the ID
+/// is what is printed on the servo a person has to go and find, and a client has to be able to
+/// say which joint that is. `duck-control` re-exports it, so the IDs the bus is driven with and
+/// the ones a client names are one table.
+pub const JOINT_IDS: [u8; 15] = [
+    20, 21, 22, 23, 24, // left leg
+    30, 31, 32, 33, 34, // neck, head, mouth
+    10, 11, 12, 13, 14, // right leg
+];
+
+/// The joint a Dynamixel ID drives, if it is one of [`JOINT_IDS`].
+pub fn joint_of(id: u8) -> Option<&'static str> {
+    JOINT_IDS
+        .iter()
+        .position(|&known| known == id)
+        .map(|index| JOINT_NAMES[index])
+}
+
 /// Method names, as they go on the wire. Namespaced so a new namespace cannot collide
 /// with `update.*`. [`Call`] is the typed form.
 pub mod method {
@@ -634,6 +668,12 @@ pub mod method {
     /// Torque is cut on every joint first and the robot is back at limp afterwards, so `robot.init`
     /// or `robot.enable` brings it up from a known state. Discrete; send as a request.
     pub const ROBOT_REBOOT_MOTORS: &str = "robot.rebootMotors";
+
+    /// Put the robot down for a rest: [`ROBOT_SHUTDOWN`]'s sequence without the power-off. A
+    /// driving robot sits with the sitstand policy, eases into the rest pose, then has torque cut
+    /// and every servo rebooted ([`ROBOT_REBOOT_MOTORS`]); a robot that cannot sit is rebooted
+    /// where it is. Ends limp, ready for `robot.init`. Discrete; send as a request.
+    pub const ROBOT_REST: &str = "robot.rest";
 
     // ── skills ───────────────────────────────────────────────────────────────
     //
@@ -893,8 +933,10 @@ pub mod method {
     /// One 8×8 depth frame, pushed after [`TOF_STREAM`].
     pub const TOF_FRAME: &str = "tof.frame";
 
-    /// Subscribe to the head IMU (BMI088 on the HAT, same I²C bus as the ToF). The answer
-    /// describes the sensor, then [`HEAD_IMU_FRAME`] notifications arrive until the connection closes.
+    /// Subscribe to the head IMU. Served by `tofd` on `zero3` (the BMI088 on the HAT, same I²C
+    /// bus as the ToF) and by `robotd` on `beta` (the face board's LSM6DSV16X); the other daemon
+    /// answers with `unavailable` naming the right one. The answer describes the sensor, then
+    /// [`HEAD_IMU_FRAME`] notifications arrive until the connection closes.
     pub const HEAD_IMU_STREAM: &str = "head_imu.stream";
 
     /// One head-IMU sample, pushed after [`HEAD_IMU_STREAM`].
@@ -1000,6 +1042,8 @@ pub enum Call {
     RobotRelax,
     /// Reboot servos (all of them, or the ids named), then limp. See [`method::ROBOT_REBOOT_MOTORS`].
     RobotRebootMotors(RebootMotorsParams),
+    /// Sit, ease into the rest pose, then torque off and reboot. See [`method::ROBOT_REST`].
+    RobotRest,
     /// Run a one-shot skill, or toggle sit↔stand.
     RobotDo(DoParams),
     /// Standing body pose. Continuous. Send as a notification.
@@ -1101,7 +1145,8 @@ pub enum Call {
     PadInput,
     /// Subscribe to the ToF depth stream. Answered by `tofd`.
     TofStream,
-    /// Subscribe to the head IMU (BMI088 on the HAT); see [`method::HEAD_IMU_STREAM`].
+    /// Subscribe to the head IMU (`tofd` on zero3, `robotd` on beta); see
+    /// [`method::HEAD_IMU_STREAM`].
     HeadImuStream,
 }
 
@@ -1182,6 +1227,7 @@ impl Call {
             Call::RobotInit => method::ROBOT_INIT,
             Call::RobotRelax => method::ROBOT_RELAX,
             Call::RobotRebootMotors(_) => method::ROBOT_REBOOT_MOTORS,
+            Call::RobotRest => method::ROBOT_REST,
             Call::RobotDo(_) => method::ROBOT_DO,
             Call::RobotPose(_) => method::ROBOT_POSE,
             Call::RobotMouth(_) => method::ROBOT_MOUTH,
@@ -1365,6 +1411,7 @@ impl Call {
             | Call::RobotInit
             | Call::RobotRelax
             | Call::RobotRebootMotors(_)
+            | Call::RobotRest
             | Call::RobotDo(_)
             | Call::RobotPose(_)
             | Call::RobotMouth(_)
@@ -1510,6 +1557,7 @@ impl Call {
             | Call::RobotStop
             | Call::RobotInit
             | Call::RobotRelax
+            | Call::RobotRest
             | Call::RobotShutdown
             | Call::RobotPolicies
             | Call::RobotModel
@@ -1571,6 +1619,7 @@ impl Call {
             method::ROBOT_INIT => Call::RobotInit,
             method::ROBOT_RELAX => Call::RobotRelax,
             method::ROBOT_REBOOT_MOTORS => Call::RobotRebootMotors(decode(params)?),
+            method::ROBOT_REST => Call::RobotRest,
             method::ROBOT_DO => Call::RobotDo(decode(params)?),
             method::ROBOT_POSE => Call::RobotPose(decode(params)?),
             method::ROBOT_MOUTH => Call::RobotMouth(decode(params)?),
@@ -1724,6 +1773,7 @@ pub mod test_support {
             Call::RobotInit,
             Call::RobotRelax,
             Call::RobotRebootMotors(RebootMotorsParams { ids: vec![3, 11] }),
+            Call::RobotRest,
             Call::RobotDo(DoParams {
                 skill: "ground_pick".into(),
             }),
@@ -3524,7 +3574,7 @@ pub struct LoopHealth {
 /// `#[serde(default)]` for the reason spelled out on [`ImuHealth`], and it applies here even more
 /// plainly: these are failure counters whose zero the doc comments below already call meaningful.
 /// An older `robotd` that omits one is saying "no failures", not "unknown".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BusHealth {
     /// Consecutive failed reads; any success resets it. One is ordinary on a serial bus,
@@ -3534,6 +3584,32 @@ pub struct BusHealth {
     /// commanded anything and is still waiting for a robot to answer — the signature of
     /// servo power being off.
     pub startup_failures: u32,
+    /// While waiting: the expected servo IDs ([`JOINT_IDS`]) that did not answer the last ping
+    /// round, in that table's order. Empty once the bus is up, before the first round, and when
+    /// the port itself would not open. All fifteen is servo power off; some of them is servos
+    /// unplugged, and naming them is the point.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub missing: Vec<u8>,
+}
+
+impl BusHealth {
+    /// Whether some servos answer and these do not — a robot that is there, with parts of it
+    /// missing, as opposed to no robot at all.
+    pub fn partly_missing(&self) -> bool {
+        !self.missing.is_empty() && self.missing.len() < JOINT_IDS.len()
+    }
+
+    /// The missing servos as people read them: `32 head_yaw, 33 head_roll`.
+    pub fn describe_missing(&self) -> String {
+        self.missing
+            .iter()
+            .map(|&id| match joint_of(id) {
+                Some(joint) => format!("{id} {joint}"),
+                None => id.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 /// The IMU board, which rides the motor bus.
@@ -3827,9 +3903,13 @@ pub struct PoseState {
 pub struct FramesState {
     pub camera: PoseState,
     pub tof: PoseState,
-    /// The head IMU (BMI088) in the trunk frame. The `head_imu.stream` samples are in the IMU's
-    /// own tilted axes; this pose (sensor→trunk, from the same head FK) is how a consumer rotates
+    /// The head IMU in the trunk frame. The `head_imu.stream` samples are in the IMU's own
+    /// tilted axes; this pose (sensor→trunk, from the same head FK) is how a consumer rotates
     /// them into the trunk/camera frame. Absent from a daemon predating it. (v24)
+    ///
+    /// **The mount is the `zero3` HAT's BMI088.** The kinematic model has no `beta` face board
+    /// yet, so on a `beta` this pose does not describe its LSM6DSV16X until the model gains that
+    /// mount.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_imu: Option<PoseState>,
 }
@@ -4396,7 +4476,7 @@ pub struct SkillsResult {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PadBindParams {
-    /// `"a"`, `"x"`, `"lb"`, `"rb"` or `"dpad_down"`. A string for the reason a slot is one: a
+    /// `"a"`, `"b"`, `"x"`, `"y"`, `"lb"` or `"rb"`. A string for the reason a slot is one: a
     /// button this build does not have should be refused with the list of ones it does.
     pub button: String,
     /// Three states in one field, the same shape [`LoadPolicyParams`] uses for a path.
@@ -4797,7 +4877,8 @@ pub struct TofFrame {
 #[serde(default)]
 pub struct HeadImuStreamResult {
     pub accepted: bool,
-    /// The IMU that answered, e.g. `BMI088`. `None` when there is none — see `unavailable`.
+    /// The IMU that answered: `BMI088` (zero3) or `LSM6DSV16X` (beta). `None` when there is
+    /// none — see `unavailable`, which also names the daemon to ask when it is not this one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sensor: Option<String>,
     /// Why there is no IMU: not fitted, bus unreadable, chip-id mismatch.
@@ -4809,7 +4890,9 @@ pub struct HeadImuStreamResult {
 
 /// One head-IMU sample — a [`method::HEAD_IMU_FRAME`] notification.
 ///
-/// The BMI088 on the HAT, read by `tofd` (it owns that I²C bus). All values are in the IMU's own
+/// Which chip and which daemon is the board's: on `zero3` the BMI088 on the HAT, read by `tofd`
+/// (it owns that I²C bus) with a Madgwick fusion; on `beta` the face board's LSM6DSV16X, read by
+/// `robotd`, its quaternion fused on the chip (SFLP game vector). All values are in the IMU's own
 /// axes, which are tilted relative to the head/camera — the mount is not axis-aligned. To place a
 /// sample in the trunk/camera frame, rotate it by [`FramesState::head_imu`] (the sensor→trunk
 /// pose the kinematics compute for this tick). This is the head IMU, distinct from the body IMU
@@ -4823,13 +4906,13 @@ pub struct HeadImuFrame {
     pub at_us: u64,
     /// `CLOCK_MONOTONIC` when the sample was read, ns — the clock [`RobotState::t_ns`] shares.
     pub t_ns: u64,
-    /// Angular velocity, rad/s, in the BMI088's own (tilted) sensor axes — NOT the head or
+    /// Angular velocity, rad/s, in the chip's own (tilted) sensor axes — NOT the head or
     /// camera frame. Combine with [`FramesState::head_imu`] (the sensor→trunk pose from the
     /// kinematics) to place it. See that field.
     pub gyro: [f32; 3],
-    /// Specific force, m/s², BMI088 sensor axes.
+    /// Specific force, m/s², the chip's sensor axes.
     pub accel: [f32; 3],
-    /// Madgwick orientation, scalar-first `[w, x, y, z]`, sensor→world (gravity down, yaw
+    /// Orientation, scalar-first `[w, x, y, z]`, sensor→world (gravity down, yaw
     /// arbitrary). The world here is the IMU's own; relate it to the trunk via the mount pose.
     pub quat: [f32; 4],
     /// Chip temperature, °C.
@@ -5567,7 +5650,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            67,
+            68,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
