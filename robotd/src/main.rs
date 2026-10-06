@@ -659,7 +659,8 @@ struct RobotState {
     mode: AtomicU8,
     /// Published by the loop so the IPC side can answer without consulting it.
     fallen: AtomicBool,
-    /// The loop's command-state motion verdict, including unfinished stops and scripted moves.
+    /// In the driving branch, an active twist or busy scripted motion sets this flag.
+    /// The restart advisory reads this flag.
     moving: AtomicBool,
     /// Torque is on and the joints are at the home pose, so the policy can drive.
     ///
@@ -912,9 +913,9 @@ impl RobotState {
                 reason: Some("forced busy by --busy".into()),
             };
         }
-        // Restarting motor control mid-stride can make the robot fall (updater-design.md §7.2).
-        // The fallen exception permits recovery of a robot already down. `moving` is the
-        // loop's commanded-motion verdict, not a measurement (robotd-design.md §3.4.1).
+        // A restart during a walking step can make the robot fall (updater-design.md §7.2).
+        // A robot that has fallen can restart for recovery. The control loop sets `moving`
+        // from its commands; it does not measure physical motion (robotd-design.md §3.4.1).
         if self.moving.load(Ordering::Relaxed) && !self.fallen.load(Ordering::Relaxed) {
             return proto::SafeToRestartResult {
                 safe: false,
@@ -1427,22 +1428,21 @@ impl RestRamp {
     }
 }
 
-/// One low-pass step toward `target`.
+/// One low-pass filter update toward `target`.
 ///
-/// A non-finite target is dropped, not folded in: `ema += α·(inf − ema)` is `inf` on this
-/// tick and on every tick after, because nothing finite can climb back out of it. The wire
-/// can produce one — JSON parses `1e400` as infinity — and the safety layer below refuses
-/// non-finite joint targets rather than clamping them, so a single bad `robot.move` would
-/// otherwise freeze the robot on its hold pose until reboot.
+/// This filter ignores a target that is not a finite number. JSON can supply infinity (`1e400`).
+/// An infinite target can make the stored value infinite or NaN. Later finite targets cannot
+/// restore a finite value. The safety layer rejects joint targets that are not finite numbers.
+/// Thus, one invalid `robot.move` request could hold the robot's pose until reboot.
 fn slew(ema: &mut f64, target: f64, alpha: f64) {
     if target.is_finite() {
         *ema += alpha * (target - *ema);
     }
 }
 
-/// The twist sent to the policy and its stop status are one state: `Stopped` can only
-/// supply an exact zero command. An active target remains active even if rounding or a
-/// direction reversal makes this tick's filtered value zero.
+/// The `Stopped` variant stores no command, so it can supply only `[0.0; 3]`.
+/// A nonzero target requires `Active`, even if rounding or a direction reversal produces a zero
+/// command during this update.
 #[derive(Default)]
 enum SmoothedTwist {
     #[default]
@@ -1451,8 +1451,9 @@ enum SmoothedTwist {
 }
 
 impl SmoothedTwist {
-    // A numerical command budget, not a measured-velocity or hardware-safety threshold.
-    // Forward/lateral: m/s; yaw: rad/s. See robotd-design.md §3.4.1 for the derivation.
+    // These component limits bound the change from an updated component to zero.
+    // Forward and lateral velocity use m/s; yaw rate uses rad/s.
+    // They do not define a physical safety limit. See robotd-design.md §3.4.1 for the reason.
     const STOP_BUDGET: [f64; 3] = [1e-6, 1e-6, 1e-6];
 
     fn command(&self) -> [f64; 3] {
@@ -1471,9 +1472,9 @@ impl SmoothedTwist {
         for (ema, target) in command.iter_mut().zip(target) {
             slew(ema, target, alpha);
         }
-        // Only a zero request may complete a stop. Compare components without squaring:
-        // a norm can underflow to zero while its command is still nonzero. NaN and infinity
-        // fail this comparison, so invalid filter state cannot certify completion either.
+        // A nonzero target must stay active even if the filtered command is zero.
+        // A squared component can underflow to zero while the component is still nonzero.
+        // Comparison of absolute values avoids that error and rejects NaN and infinity.
         *self = if target == [0.0; 3]
             && command
                 .iter()
@@ -1947,9 +1948,9 @@ async fn control_loop<T: RobotIo>(
     // robot goes home first, and the swap happens there.
     let mut pending_swap: Option<PendingSwap> = None;
 
-    // Command smoothing, per the prototype: `cmd += α × (target − cmd)` at the tick rate.
-    // A stick snap becomes a ramp the gait can follow; the state lives here because it is
-    // per-tick, which the intent slots must not be.
+    // The prototype's filter limits sudden command changes: `cmd += α × (target − cmd)`.
+    // Its state belongs to the control loop because each loop update must advance the filter,
+    // independently of when an intent arrives.
     let dt = period.as_secs_f64();
     let cmd_alpha = params.control.cmd_alpha.clamp(0.0, 1.0);
     let head_alpha = params.control.head_alpha.clamp(0.0, 1.0);
@@ -2789,9 +2790,8 @@ async fn control_loop<T: RobotIo>(
             None => false,
         };
 
-        // Smooth the command. The limp-fall sequence holds the twist at zero outright, so
-        // the robot is not handed back mid-command; and leaving body-pose mode snaps the
-        // body back to nominal rather than gliding, which is its B-button exit.
+        // The limp-fall sequence clears the twist so recovery cannot resume an unfinished command.
+        // The B-button exit from body-pose mode restores the nominal body pose immediately.
         let twist_target = if in_limp_fall { [0.0; 3] } else { gated.twist };
         if in_limp_fall {
             twist = SmoothedTwist::Stopped;
@@ -3160,7 +3160,7 @@ async fn control_loop<T: RobotIo>(
                     Ok(step) => (
                         step.targets,
                         step.gain,
-                        // A scripted move is motion whatever the twist says; so is walking.
+                        // Scripted motion must block restart even after the twist stop completes.
                         step.busy || !twist.is_stopped(),
                         step.label,
                     ),
@@ -9162,10 +9162,11 @@ mod tests {
         assert!((ema - 0.65).abs() < 1e-12, "{}", ema);
     }
 
-    /// The transition alone cannot catch a loop that sends the old tail to the policy or
-    /// publishes restart readiness too soon. The ONNX fixture echoes its received twist
-    /// at three zero-home joints, and the IO probe samples the advisory on that same write.
-    /// Run explicitly with ORT_DYLIB_PATH set, like the existing recurrent-policy tests.
+    /// Filter tests cannot detect an incorrect command or restart advisory from the control loop.
+    /// The ONNX fixture copies the received twist to three joints whose home positions are zero.
+    /// The IO probe reads the restart advisory during the same write of joint targets.
+    ///
+    /// Set `ORT_DYLIB_PATH` to an ONNX Runtime library. Run this ignored test explicitly.
     #[tokio::test]
     #[ignore = "requires ONNX Runtime >= 1.23"]
     async fn a_completed_twist_stop_reaches_the_policy_and_restart_advisory() {
@@ -9237,7 +9238,7 @@ mod tests {
             kick_left: Some(fixture.clone()),
             kick_right: Some("none".into()),
             roulade: Some("none".into()),
-            // Expose the fixture's action directly, without a second filter or scaling.
+            // Additional filtering or scaling would change the fixture's command values.
             action_scale: Some(1.0),
             head_lowpass: Some(1.0),
             legs_lowpass: Some(1.0),
@@ -9281,8 +9282,9 @@ mod tests {
                 }
             }
 
-            // Both explicit release and the real deadman must finish the tail. Renew the
-            // demand while ramping up; then let the normal 500 ms deadman gate it to zero.
+            // An explicit stop and the 500 ms deadman timeout must each complete the twist stop.
+            // Repeated commands keep the target active before each stop.
+            // Thus, neither case starts idle.
             for deadman in [false, true] {
                 for _ in 0..4 {
                     intents.set_twist([0.4, -0.15, 0.5]);
@@ -9311,8 +9313,8 @@ mod tests {
                 }
             }
 
-            // Binary64 underflow can give a live request an exact zero output. The real
-            // loop must still publish Active, even though the network also receives zero.
+            // Binary64 underflow can produce zero output for a nonzero target.
+            // The restart advisory must stay false while that target is active.
             intents.set_twist([f64::from_bits(1), 0.0, 0.0]);
             let (frame, safe) = tick(&mut frames, &mut writes).await;
             assert_eq!(frame.movement.applied, [0.0; 3]);
@@ -9324,8 +9326,8 @@ mod tests {
             assert!(!tick(&mut frames, &mut writes).await.1);
             intents.request_skill(0);
             intents.stop();
-            // The fixture skill outlasts the default tail: at its terminal zero the
-            // controller's busy result, rather than the twist, must still block restart.
+            // This scripted motion continues after the twist stop completes.
+            // The controller's busy result must block restart during that remaining motion.
             loop {
                 let (frame, safe) = tick(&mut frames, &mut writes).await;
                 assert_eq!(frame.policy, "kick_left");
@@ -9356,8 +9358,9 @@ mod tests {
             .expect("control loop must stop");
     }
 
-    /// Pin both sides of the documented default completion times: an earlier snap would
-    /// silently increase the command budget, while a later one would extend the stop.
+    /// The filter must stay active on the preceding update and stop on the documented update.
+    /// An earlier stop could make the additional change to zero more than the component limit.
+    /// A later stop would increase the duration.
     #[test]
     fn a_zero_twist_target_completes_the_default_ramp() {
         let alpha = Params::default().control.cmd_alpha;
@@ -9382,8 +9385,9 @@ mod tests {
         }
     }
 
-    /// Pin each documented budget independently of STOP_BUDGET so a changed constant
-    /// cannot move its own test boundary. Invalid filter state must never certify a stop.
+    /// The expected limits do not depend on `STOP_BUDGET`.
+    /// Thus, a changed constant cannot also change the test's expected result.
+    /// A command with NaN or infinity must not complete a stop.
     #[test]
     fn a_twist_stop_requires_every_component_within_its_budget() {
         for axis in 0..3 {
@@ -9408,8 +9412,8 @@ mod tests {
         }
     }
 
-    /// Looking only at the output would accept a reversal's zero crossing or underflowed
-    /// live input. Both must remain active; non-finite requests cannot mean "stop" either.
+    /// A zero output can occur during a direction reversal or from underflow of a nonzero target.
+    /// Both cases must stay active. A target with NaN or infinity must also stay active.
     #[test]
     fn a_live_twist_target_cannot_complete_a_stop() {
         let mut reversal = SmoothedTwist::Active([-1.0, 0.0, 0.0]);

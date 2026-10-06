@@ -47,11 +47,13 @@ port = "/dev/ttyS2"
 # given rate, and the loop's own five-minute summary reports the same from inside robotd.
 hz = 50
 
-# Per-tick EMA smoothing on incoming commands: `cmd += alpha * (target - cmd)`. The
-# prototype's `--cmd-alpha` / `--head-alpha` — a stick snap becomes a ramp the gait can
-# follow. 1.0 is pass-through. `cmd_alpha` covers the velocity twist and the body pose;
-# `head_alpha` covers head targets. A released twist ends at exact zero rather than
-# decaying forever (docs/design/robotd-design.md §3.4.1).
+# An exponential moving average (EMA) limits sudden command changes.
+# Each control-loop update applies `cmd += alpha * (target - cmd)`.
+# The prototype uses `--cmd-alpha` and `--head-alpha` for these coefficients.
+# At 1.0, the filter uses the full change `target - cmd` in one update.
+# `cmd_alpha` controls the velocity twist and body pose; `head_alpha` controls head targets.
+# At the default coefficient, a constant zero twist target causes the applied twist to reach zero.
+# This requires all stored components to be finite numbers (docs/design/robotd-design.md §3.4.1).
 # cmd_alpha = 0.2
 # head_alpha = 0.2
 

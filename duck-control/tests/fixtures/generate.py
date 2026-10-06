@@ -24,8 +24,8 @@ def save(name, nodes, inputs, outputs, initializers):
 ff = save('feedforward', [h.make_node('Gather', ['obs', 'indices'], ['output'], axis=1)],
           [info('obs', [1, 61])], [info('output', [1, 14])],
           [nh.from_array(np.arange(14, dtype=np.int64), 'indices')])
-# Echo the policy's received twist at zero-home joints 0, 7 and 8. Used by robotd's
-# real-loop restart test so an output, not a copied filter, witnesses the command.
+# The fixture copies the received twist to joints 0, 7 and 8, whose home positions are zero.
+# The robotd control-loop test can thus read the policy command from the joint targets.
 save('twist_echo', [h.make_node('Gather', ['obs', 'indices'], ['output'], axis=1)],
      [info('obs', [1, 61])], [info('output', [1, 14])],
      [nh.from_array(np.array([48 + i % 3 for i in range(14)], dtype=np.int64), 'indices')])
