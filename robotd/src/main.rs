@@ -9161,6 +9161,197 @@ mod tests {
         assert!((ema - 0.65).abs() < 1e-12, "{}", ema);
     }
 
+    /// The transition alone cannot catch a loop that sends the old tail to the policy or
+    /// publishes restart readiness too soon. The ONNX fixture echoes its received twist
+    /// at three zero-home joints, and the IO probe samples the advisory on that same write.
+    /// Run explicitly with ORT_DYLIB_PATH set, like the existing recurrent-policy tests.
+    #[tokio::test]
+    #[ignore = "requires ONNX Runtime >= 1.23"]
+    async fn a_completed_twist_stop_reaches_the_policy_and_restart_advisory() {
+        struct Probe {
+            io: FakeIo,
+            state: Arc<RobotState>,
+            tx: tokio::sync::mpsc::UnboundedSender<([f64; 3], bool)>,
+        }
+        impl RobotIo for Probe {
+            fn read(&mut self) -> duck_control::io::Result<duck_control::Sensors> {
+                self.io.read()
+            }
+            fn write(&mut self, targets: &duck_control::JointTargets) -> duck_control::io::Result<()> {
+                self.io.write(targets)?;
+                self.tx
+                    .send((
+                        [0, 7, 8].map(|j| targets.positions[j]),
+                        self.state.safe_to_restart().safe,
+                    ))
+                    .expect("probe receiver");
+                Ok(())
+            }
+            fn set_gain(&mut self, gain: u16) -> duck_control::io::Result<()> {
+                self.io.set_gain(gain)
+            }
+            fn set_torque(&mut self, on: bool) -> duck_control::io::Result<()> {
+                self.io.set_torque(on)
+            }
+            fn reboot(&mut self, id: u8) -> duck_control::io::Result<()> {
+                self.io.reboot(id)
+            }
+            fn slow_sensors(&mut self) -> duck_control::io::Result<duck_control::SlowSensors> {
+                self.io.slow_sensors()
+            }
+        }
+
+        async fn tick(
+            frames: &mut tokio::sync::broadcast::Receiver<proto::RobotState>,
+            writes: &mut tokio::sync::mpsc::UnboundedReceiver<([f64; 3], bool)>,
+        ) -> (proto::RobotState, bool) {
+            let frame = frames.recv().await.expect("state frame");
+            let (echo, safe) = writes.recv().await.expect("motor write");
+            assert!(!frame.safety.fallen, "must exercise the upright advisory");
+            match frame.policy.as_str() {
+                "walk" | "stand" => assert_eq!(
+                    echo,
+                    frame.movement.applied.map(|v| f64::from(v as f32)),
+                    "the real network must receive this tick's published command"
+                ),
+                "kick_left" => assert_eq!(echo, [0.0; 3]),
+                "homing" => {}
+                label => panic!("policy did not drive: {label}"),
+            }
+            (frame, safe)
+        }
+
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../duck-control/tests/fixtures/twist_echo.onnx");
+        let mut params = Params::default();
+        params.audio.enabled = false;
+        params.policy = params::PolicyParams {
+            walk: Some(fixture.clone()),
+            stand: Some(fixture.clone()),
+            sitstand: Some("none".into()),
+            ground_pick: Some("none".into()),
+            kick_left: Some(fixture.clone()),
+            kick_right: Some("none".into()),
+            roulade: Some("none".into()),
+            // Expose the fixture's action directly, without a second filter or scaling.
+            action_scale: Some(1.0),
+            head_lowpass: Some(1.0),
+            legs_lowpass: Some(1.0),
+            voltage_adapt: false,
+            skills: vec![params::SkillDef {
+                name: "kick_left".into(),
+                path: Some(fixture),
+                duration: 2.0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("robotd.toml");
+        let state = Arc::new(RobotState::new(&params, &path, false, false));
+        let intents = Arc::new(Intents::new());
+        intents.set_enabled(true);
+        let mut frames = state.state_tx.subscribe();
+        let (tx, mut writes) = tokio::sync::mpsc::unbounded_channel();
+        let run = control_loop(
+            Probe {
+                io: FakeIo::at(DEFAULT_POSITION).frozen(),
+                state: Arc::clone(&state),
+                tx,
+            },
+            Arc::clone(&state),
+            Arc::clone(&intents),
+            params,
+            path,
+            Duration::from_millis(20),
+            noop_poweroff(),
+        );
+        tokio::pin!(run);
+
+        let check = async {
+            loop {
+                let (frame, safe) = tick(&mut frames, &mut writes).await;
+                if frame.policy == "stand" {
+                    assert!(safe);
+                    break;
+                }
+            }
+
+            // Both explicit release and the real deadman must finish the tail. Renew the
+            // demand while ramping up; then let the normal 500 ms deadman gate it to zero.
+            for deadman in [false, true] {
+                for _ in 0..4 {
+                    intents.set_twist([0.4, -0.15, 0.5]);
+                    let (frame, safe) = tick(&mut frames, &mut writes).await;
+                    assert_ne!(frame.movement.applied, [0.0; 3]);
+                    assert!(!safe, "live demand must block restarting");
+                }
+                if !deadman {
+                    intents.stop();
+                }
+                let mut stopping_ticks = 0;
+                loop {
+                    let (frame, safe) = tick(&mut frames, &mut writes).await;
+                    let stopping = !deadman
+                        || frame.movement.limited_by.iter().any(|l| l == "deadman");
+                    if stopping {
+                        stopping_ticks += 1;
+                        assert!(stopping_ticks <= 62, "the default tail never completed");
+                    }
+                    if frame.movement.applied == [0.0; 3] {
+                        assert!(stopping, "a live demand was treated as stopped");
+                        assert!(safe, "the terminal zero must permit an idle restart");
+                        break;
+                    }
+                    assert!(!safe, "a residual command must block restarting");
+                }
+            }
+
+            // Binary64 underflow can give a live request an exact zero output. The real
+            // loop must still publish Active, even though the network also receives zero.
+            intents.set_twist([f64::from_bits(1), 0.0, 0.0]);
+            let (frame, safe) = tick(&mut frames, &mut writes).await;
+            assert_eq!(frame.movement.applied, [0.0; 3]);
+            assert!(!safe, "zero output is not a completed stop");
+            intents.stop();
+            assert!(tick(&mut frames, &mut writes).await.1);
+
+            intents.set_twist([0.4, 0.0, 0.0]);
+            assert!(!tick(&mut frames, &mut writes).await.1);
+            intents.request_skill(0);
+            intents.stop();
+            // The fixture skill outlasts the default tail: at its terminal zero the
+            // controller's busy result, rather than the twist, must still block restart.
+            loop {
+                let (frame, safe) = tick(&mut frames, &mut writes).await;
+                assert_eq!(frame.policy, "kick_left");
+                assert!(!safe, "a scripted move must block restarting");
+                if frame.movement.applied == [0.0; 3] {
+                    break;
+                }
+            }
+            loop {
+                let (frame, safe) = tick(&mut frames, &mut writes).await;
+                if frame.policy == "stand" {
+                    assert!(safe, "an idle controller with zero twist permits restart");
+                    break;
+                }
+                assert_eq!(frame.policy, "kick_left");
+                assert!(!safe);
+            }
+        };
+        tokio::select! {
+            () = &mut run => panic!("control loop exited before verification"),
+            result = tokio::time::timeout(Duration::from_secs(30), check) => {
+                result.expect("control-loop verification timed out");
+            }
+        }
+        state.shutdown.store(true, Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_secs(1), run)
+            .await
+            .expect("control loop must stop");
+    }
+
     /// The old scalar filter still has a tail when the twist's terminal command is due.
     /// Exercise the production transition; this is not a gait or physical-stop test.
     #[test]

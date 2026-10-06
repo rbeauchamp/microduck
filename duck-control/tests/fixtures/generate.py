@@ -24,6 +24,11 @@ def save(name, nodes, inputs, outputs, initializers):
 ff = save('feedforward', [h.make_node('Gather', ['obs', 'indices'], ['output'], axis=1)],
           [info('obs', [1, 61])], [info('output', [1, 14])],
           [nh.from_array(np.arange(14, dtype=np.int64), 'indices')])
+# Echo the policy's received twist at zero-home joints 0, 7 and 8. Used by robotd's
+# real-loop restart test so an output, not a copied filter, witnesses the command.
+save('twist_echo', [h.make_node('Gather', ['obs', 'indices'], ['output'], axis=1)],
+     [info('obs', [1, 61])], [info('output', [1, 14])],
+     [nh.from_array(np.array([48 + i % 3 for i in range(14)], dtype=np.int64), 'indices')])
 rng = np.random.default_rng(42)
 weights = [nh.from_array(rng.normal(0, .15, shape).astype('float32'), name)
            for name, shape in [('W', (1, 8, 61)), ('R', (1, 8, 2)), ('B', (1, 16))]]
