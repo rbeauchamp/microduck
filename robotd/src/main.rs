@@ -9177,7 +9177,10 @@ mod tests {
             fn read(&mut self) -> duck_control::io::Result<duck_control::Sensors> {
                 self.io.read()
             }
-            fn write(&mut self, targets: &duck_control::JointTargets) -> duck_control::io::Result<()> {
+            fn write(
+                &mut self,
+                targets: &duck_control::JointTargets,
+            ) -> duck_control::io::Result<()> {
                 self.io.write(targets)?;
                 self.tx
                     .send((
@@ -9292,8 +9295,8 @@ mod tests {
                 let mut stopping_ticks = 0;
                 loop {
                     let (frame, safe) = tick(&mut frames, &mut writes).await;
-                    let stopping = !deadman
-                        || frame.movement.limited_by.iter().any(|l| l == "deadman");
+                    let stopping =
+                        !deadman || frame.movement.limited_by.iter().any(|l| l == "deadman");
                     if stopping {
                         stopping_ticks += 1;
                         assert!(stopping_ticks <= 62, "the default tail never completed");
